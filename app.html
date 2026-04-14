@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nepal e-Voting System</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #111; min-height: 100vh; }
+  button { cursor: pointer; font-family: inherit; }
+  input, select { font-family: inherit; outline: none; }
+  input:focus, select:focus { border-color: #185FA5 !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+
+<script>
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INDEXEDDB DATABASE LAYER
+// Permanent storage — survives refresh, restart, cache clears
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DB_NAME    = "NepalVotingDB";
+const DB_VERSION = 1;
+
+// All stores (tables) in the database
+const STORES = {
+  VOTERS:  "voters",   // Registered voter records
+  FPTP:    "fptp",     // FPTP votes per constituency
+  PR:      "pr",       // PR/Samanupatik votes per party
+  META:    "meta",     // Misc config (invalid count, etc.)
+};
+
+let db = null; // Holds the open database connection
+
+// Open (or create) the database
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (db) { resolve(db); return; }
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+    // Called once on first run — creates all object stores
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains(STORES.VOTERS)) d.createObjectStore(STORES.VOTERS, { keyPath: "id" });
+      if (!d.objectStoreNames.contains(STORES.FPTP))   d.createObjectStore(STORES.FPTP,   { keyPath: "constituency" });
+      if (!d.objectStoreNames.contains(STORES.PR))     d.createObjectStore(STORES.PR,     { keyPath: "party" });
+      if (!d.objectStoreNames.contains(STORES.META))   d.createObjectStore(STORES.META,   { keyPath: "key" });
+    };
+
+    req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+// Generic helpers ─────────────────────────────────────────────────────────────
+
+function dbGet(store, key) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const req = d.transaction(store, "readonly").objectStore(store).get(key);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  }));
+}
+
+function dbPut(store, value) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const req = d.transaction(store, "readwrite").objectStore(store).put(value);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  }));
+}
+
+function dbDelete(store, key) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const req = d.transaction(store, "readwrite").objectStore(store).delete(key);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  }));
+}
+
+function dbGetAll(store) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const req = d.transaction(store, "readonly").objectStore(store).getAll();
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  }));
+}
+
+// ── Domain-specific DB functions ─────────────────────────────────────────────
+
+// Voters
+async function dbLoadVoters() {
+  const rows = await dbGetAll(STORES.VOTERS);
+  const out = {};
+  rows.forEach(r => { out[r.id] = r; delete out[r.id].id; });
+  return out;
+}
+async function dbSaveVoter(id, data) {
+  await dbPut(STORES.VOTERS, { id, ...data });
+}
+async function dbDeleteVoter(id) {
+  await dbDelete(STORES.VOTERS, id);
+}
+
+// FPTP votes
+async function dbLoadFptp() {
+  const rows = await dbGetAll(STORES.FPTP);
+  const out = {};
+  rows.forEach(r => { out[r.constituency] = r.votes; });
+  return out;
+}
+async function dbSaveFptpConstituency(constituency, votes) {
+  await dbPut(STORES.FPTP, { constituency, votes });
+}
+
+// PR votes
+async function dbLoadPr() {
+  const rows = await dbGetAll(STORES.PR);
+  const out = { RSP: 0, NC: 0, CPN: 0 };
+  rows.forEach(r => { out[r.party] = r.count; });
+  return out;
+}
+async function dbSavePrParty(party, count) {
+  await dbPut(STORES.PR, { party, count });
+}
+
+// Meta
+async function dbGetMeta(key, fallback) {
+  const row = await dbGet(STORES.META, key);
+  return row ? row.value : fallback;
+}
+async function dbSetMeta(key, value) {
+  await dbPut(STORES.META, { key, value });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const PARTIES = {
+  RSP: { name: "Rastriya Swatantra Party", short: "RSP", color: "#185FA5", bg: "#E6F1FB", text: "#0C447C" },
+  NC:  { name: "Nepali Congress",           short: "NC",  color: "#A32D2D", bg: "#FCEBEB", text: "#791F1F" },
+  CPN: { name: "CPN-UML",                   short: "CPN", color: "#3B6D11", bg: "#EAF3DE", text: "#27500A" },
+};
+
+const CONSTITUENCIES = [
+  "Kathmandu-1", "Kathmandu-2", "Kathmandu-3",
+  "Lalitpur-1",  "Bhaktapur-1",
+  "Chitwan-1",   "Chitwan-2",
+  "Pokhara-1",   "Pokhara-2",
+  "Butwal-1",    "Dharan-1",    "Biratnagar-1"
+];
+
+const ADMIN_PASSWORD = "admin123";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REUSABLE UI COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function Card({ children, style = {} }) {
+  return React.createElement("div", {
+    style: { background: "#fff", border: "1px solid #e5e5e5", borderRadius: 12, padding: "1rem 1.25rem", ...style }
+  }, children);
+}
+
+function MetricCard({ label, value, color }) {
+  return React.createElement("div", {
+    style: { background: "#f9f9f9", borderRadius: 8, padding: "0.75rem 1rem", textAlign: "center" }
+  },
+    React.createElement("div", { style: { fontSize: 11, color: "#888", marginBottom: 4 } }, label),
+    React.createElement("div", { style: { fontSize: 20, fontWeight: 600, color: color || "#111" } }, value)
+  );
+}
+
+function Badge({ color, bg, text, children }) {
+  return React.createElement("span", {
+    style: { background: bg, color: text, border: `1px solid ${color}40`, borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 500 }
+  }, children);
+}
+
+function PartyBar({ party, votes, total }) {
+  const pct = total > 0 ? Math.round((votes / total) * 100) : 0;
+  const p = PARTIES[party];
+  return React.createElement("div", { style: { marginBottom: 10 } },
+    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 } },
+      React.createElement("span", { style: { fontWeight: 500 } }, p.short),
+      React.createElement("span", { style: { color: "#888" } }, `${votes} votes (${pct}%)`)
+    ),
+    React.createElement("div", { style: { background: "#f0f0f0", borderRadius: 4, height: 8, overflow: "hidden" } },
+      React.createElement("div", { style: { width: pct + "%", background: p.color, height: "100%", borderRadius: 4, transition: "width 0.5s" } })
+    )
+  );
+}
+
+function Alert({ message, type }) {
+  if (!message) return null;
+  const c = { error: { bg:"#FCEBEB",color:"#791F1F",border:"#F7C1C1" }, success: { bg:"#EAF3DE",color:"#27500A",border:"#C0DD97" }, info: { bg:"#E6F1FB",color:"#0C447C",border:"#B5D4F4" } }[type] || {};
+  return React.createElement("div", { style: { margin: "0.5rem 0", padding: "10px 14px", borderRadius: 8, fontSize: 13, background: c.bg, color: c.color, border: `1px solid ${c.border}` } }, message);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EYE / IRIS SCANNER (animated canvas)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function EyeScanner({ onScanComplete }) {
+  const canvasRef = useRef(null);
+  const [phase, setPhase] = useState("idle");
+  const animRef  = useRef(null);
+  const frameRef = useRef(0);
+
+  const draw = useCallback((p) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height, cx = W / 2, cy = H / 2;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#0a0f1e"; ctx.fillRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = "rgba(24,95,165,0.15)"; ctx.lineWidth = 0.5;
+    for (let x = 0; x < W; x += 20) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for (let y = 0; y < H; y += 20) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+    const t = frameRef.current * 0.04;
+
+    if (p === "idle") {
+      const pulse = 0.5 + 0.5 * Math.sin(t * 2);
+      ctx.beginPath(); ctx.arc(cx,cy,62,0,Math.PI*2); ctx.strokeStyle=`rgba(24,95,165,${0.3+pulse*0.3})`; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,48,0,Math.PI*2); ctx.strokeStyle="rgba(24,95,165,0.4)"; ctx.lineWidth=1; ctx.stroke();
+      [[cx-72,cy,cx-54,cy],[cx+54,cy,cx+72,cy],[cx,cy-72,cx,cy-54],[cx,cy+54,cx,cy+72]].forEach(([x1,y1,x2,y2])=>{
+        ctx.strokeStyle="rgba(24,95,165,0.5)"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      });
+      ctx.beginPath(); ctx.ellipse(cx,cy,44,26,0,0,Math.PI*2); ctx.strokeStyle="rgba(24,95,165,0.6)"; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,18,0,Math.PI*2); ctx.strokeStyle="rgba(24,95,165,0.5)"; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,10,0,Math.PI*2); ctx.fillStyle="rgba(24,95,165,0.15)"; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx,cy,5,0,Math.PI*2); ctx.fillStyle="#185FA5"; ctx.fill();
+      ctx.fillStyle="rgba(24,95,165,0.7)"; ctx.font="9px monospace"; ctx.textAlign="center";
+      ctx.fillText("PLACE EYE TO SCAN", cx, cy+82);
+    }
+
+    else if (p === "scanning") {
+      const prog = Math.min(frameRef.current / 80, 1);
+      ctx.beginPath(); ctx.arc(cx,cy,65,0,Math.PI*2); ctx.strokeStyle="rgba(24,95,165,0.3)"; ctx.lineWidth=1; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,65,t,t+Math.PI*1.5); ctx.strokeStyle="#378ADD"; ctx.lineWidth=2.5; ctx.stroke();
+      const scanY = cy - 28 + 56 * ((frameRef.current % 80) / 80);
+      const g = ctx.createLinearGradient(cx-44,scanY,cx+44,scanY);
+      g.addColorStop(0,"rgba(55,138,221,0)"); g.addColorStop(0.5,"rgba(55,138,221,0.9)"); g.addColorStop(1,"rgba(55,138,221,0)");
+      ctx.fillStyle=g; ctx.fillRect(cx-44,scanY-1,88,2);
+      ctx.save(); ctx.beginPath(); ctx.ellipse(cx,cy,44,26,0,0,Math.PI*2); ctx.clip();
+      const eg = ctx.createLinearGradient(cx,cy-26,cx,scanY);
+      eg.addColorStop(0,"rgba(24,95,165,0.3)"); eg.addColorStop(1,"rgba(24,95,165,0.05)");
+      ctx.fillStyle=eg; ctx.fillRect(cx-44,cy-26,88,56); ctx.restore();
+      ctx.beginPath(); ctx.ellipse(cx,cy,44,26,0,0,Math.PI*2); ctx.strokeStyle="#378ADD"; ctx.lineWidth=2; ctx.stroke();
+      for (let r=0;r<3;r++){ctx.beginPath();ctx.arc(cx,cy,20-r*4,0,Math.PI*2);ctx.strokeStyle=`rgba(55,138,221,${0.6-r*0.15})`;ctx.lineWidth=1;ctx.stroke();}
+      ctx.beginPath(); ctx.arc(cx,cy,6,0,Math.PI*2); ctx.fillStyle="#0C447C"; ctx.fill();
+      [[-1,-1],[1,-1],[1,1],[-1,1]].forEach(([sx,sy])=>{
+        const bx=cx+sx*68,by=cy+sy*40,bl=12;
+        ctx.strokeStyle="#378ADD"; ctx.lineWidth=2;
+        ctx.beginPath();ctx.moveTo(bx,by+sy*-bl);ctx.lineTo(bx,by);ctx.lineTo(bx+sx*-bl,by);ctx.stroke();
+      });
+      ctx.fillStyle="#378ADD"; ctx.font="9px monospace"; ctx.textAlign="center";
+      ctx.fillText(`SCANNING... ${Math.round(prog*100)}%`,cx,cy+82); ctx.fillText("DO NOT MOVE",cx,cy+94);
+    }
+
+    else if (p === "done") {
+      const pulse = 0.5+0.5*Math.sin(t*3);
+      [80,65,50].forEach((r,i)=>{ ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.strokeStyle=`rgba(59,109,17,${0.2+i*0.1+pulse*0.1})`;ctx.lineWidth=1+i;ctx.stroke(); });
+      ctx.beginPath(); ctx.ellipse(cx,cy,44,26,0,0,Math.PI*2); ctx.fillStyle="rgba(59,109,17,0.1)"; ctx.fill(); ctx.strokeStyle="#639922"; ctx.lineWidth=2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,20,0,Math.PI*2); ctx.strokeStyle="#639922"; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx,cy,13,0,Math.PI*2); ctx.fillStyle="rgba(59,109,17,0.2)"; ctx.fill();
+      ctx.strokeStyle="#3B6D11"; ctx.lineWidth=2.5; ctx.lineCap="round";
+      ctx.beginPath(); ctx.moveTo(cx-7,cy); ctx.lineTo(cx-2,cy+6); ctx.lineTo(cx+8,cy-5); ctx.stroke();
+      [[cx-72,cy,cx-54,cy],[cx+54,cy,cx+72,cy],[cx,cy-72,cx,cy-54],[cx,cy+54,cx,cy+72]].forEach(([x1,y1,x2,y2])=>{
+        ctx.strokeStyle="#639922"; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      });
+      ctx.fillStyle="#3B6D11"; ctx.font="bold 9px monospace"; ctx.textAlign="center"; ctx.fillText("IRIS VERIFIED",cx,cy+82);
+      ctx.fillStyle="#639922"; ctx.font="9px monospace"; ctx.fillText("IDENTITY CONFIRMED",cx,cy+94);
+    }
+
+    else if (p === "failed") {
+      const pulse=0.5+0.5*Math.sin(t*5);
+      ctx.beginPath(); ctx.arc(cx,cy,65,0,Math.PI*2); ctx.strokeStyle=`rgba(163,45,45,${0.4+pulse*0.3})`; ctx.lineWidth=2; ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(cx,cy,44,26,0,0,Math.PI*2); ctx.strokeStyle="#A32D2D"; ctx.lineWidth=2; ctx.stroke();
+      ctx.strokeStyle="#A32D2D"; ctx.lineWidth=2.5; ctx.lineCap="round";
+      ctx.beginPath(); ctx.moveTo(cx-7,cy-7); ctx.lineTo(cx+7,cy+7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx+7,cy-7); ctx.lineTo(cx-7,cy+7); ctx.stroke();
+      ctx.fillStyle="#A32D2D"; ctx.font="bold 9px monospace"; ctx.textAlign="center"; ctx.fillText("SCAN FAILED",cx,cy+82);
+      ctx.fillStyle="#791F1F"; ctx.font="9px monospace"; ctx.fillText("TRY AGAIN",cx,cy+94);
+    }
+  }, []);
+
+  useEffect(() => {
+    const loop = () => { frameRef.current++; draw(phase); animRef.current = requestAnimationFrame(loop); };
+    animRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [phase, draw]);
+
+  const startScan = () => {
+    if (phase === "scanning") return;
+    setPhase("scanning"); frameRef.current = 0;
+    setTimeout(() => {
+      const ok = Math.random() > 0.2;
+      setPhase(ok ? "done" : "failed");
+      if (ok) onScanComplete(true);
+    }, 3200);
+  };
+  const reset = () => { setPhase("idle"); onScanComplete(false); frameRef.current = 0; };
+
+  return React.createElement("div", { style: { display:"flex", flexDirection:"column", alignItems:"center", gap:10 } },
+    React.createElement("canvas", { ref:canvasRef, width:180, height:200,
+      style: { borderRadius:12, border:"1px solid #1a2a4a", cursor:(phase==="idle"||phase==="failed")?"pointer":"default" },
+      onClick: (phase==="idle"||phase==="failed") ? startScan : undefined }),
+    React.createElement("div", { style:{ display:"flex", gap:6 } },
+      (phase==="idle"||phase==="failed") && React.createElement("button",{onClick:startScan,style:{fontSize:11,padding:"5px 14px",borderRadius:6,background:"#185FA5",color:"#fff",border:"none",cursor:"pointer"}}, phase==="failed"?"Retry Scan":"Start Scan"),
+      (phase==="done"||phase==="failed") && React.createElement("button",{onClick:reset,style:{fontSize:11,padding:"5px 14px",borderRadius:6,background:"transparent",border:"1px solid #ddd",color:"#888",cursor:"pointer"}},"Reset")
+    )
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function App() {
+  const [page,         setPage]         = useState("home");
+  const [voters,       setVoters]       = useState({});
+  const [fptpVotes,    setFptpVotes]    = useState({});
+  const [prVotes,      setPrVotes]      = useState({ RSP:0, NC:0, CPN:0 });
+  const [invalidCount, setInvalidCount] = useState(0);
+  const [currentVoter, setCurrentVoter] = useState(null);
+  const [adminAuth,    setAdminAuth]    = useState(false);
+  const [msg,          setMsg]          = useState(null);
+  const [dbReady,      setDbReady]      = useState(false);
+
+  // Load everything from IndexedDB on startup
+  useEffect(() => {
+    (async () => {
+      try {
+        const [v, f, p, inv] = await Promise.all([
+          dbLoadVoters(),
+          dbLoadFptp(),
+          dbLoadPr(),
+          dbGetMeta("invalidCount", 0),
+        ]);
+        setVoters(v);
+        setFptpVotes(f);
+        setPrVotes(p);
+        setInvalidCount(inv);
+        setDbReady(true);
+      } catch (e) {
+        console.error("DB load error:", e);
+        setDbReady(true);
+      }
+    })();
+  }, []);
+
+  const showMsg = (text, type = "info") => { setMsg({ text, type }); setTimeout(() => setMsg(null), 3500); };
+
+  // ── Save helpers (update state + write to IndexedDB) ──────────────────────
+
+  const saveVoter = async (id, data) => {
+    await dbSaveVoter(id, data);
+    setVoters(prev => ({ ...prev, [id]: data }));
+  };
+
+  const deleteVoterDB = async (id) => {
+    await dbDeleteVoter(id);
+    setVoters(prev => { const n = { ...prev }; delete n[id]; return n; });
+  };
+
+  const recordFptpVote = async (constituency, party) => {
+    const current = fptpVotes[constituency] || { RSP:0, NC:0, CPN:0 };
+    const updated = { ...current, [party]: (current[party] || 0) + 1 };
+    await dbSaveFptpConstituency(constituency, updated);
+    setFptpVotes(prev => ({ ...prev, [constituency]: updated }));
+    return updated;
+  };
+
+  const recordPrVote = async (party) => {
+    const updated = { ...prVotes, [party]: (prVotes[party] || 0) + 1 };
+    await dbSavePrParty(party, updated[party]);
+    setPrVotes(updated);
+  };
+
+  const markVoted = async (id) => {
+    const updated = { ...voters[id], hasVoted: true, votedAt: Date.now() };
+    await dbSaveVoter(id, updated);
+    setVoters(prev => ({ ...prev, [id]: updated }));
+  };
+
+  const resetVoterVote = async (id) => {
+    const updated = { ...voters[id], hasVoted: false, votedAt: null };
+    await dbSaveVoter(id, updated);
+    setVoters(prev => ({ ...prev, [id]: updated }));
+  };
+
+  if (!dbReady) return React.createElement("div", {
+    style: { display:"flex", alignItems:"center", justifyContent:"center", height:"100vh", flexDirection:"column", gap:12 }
+  },
+    React.createElement("div", { style:{ width:32,height:32,border:"3px solid #185FA5",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite" } }),
+    React.createElement("style", null, "@keyframes spin{to{transform:rotate(360deg)}}"),
+    React.createElement("div", { style:{ fontSize:13,color:"#888" } }, "Loading database...")
+  );
+
+  const totalVoters = Object.keys(voters).length;
+  const votedCount  = Object.values(voters).filter(v => v.hasVoted).length;
+
+  return React.createElement("div", { style:{ maxWidth:760,margin:"0 auto",padding:"1rem",fontFamily:"system-ui,sans-serif" } },
+    // Header
+    React.createElement("div", { style:{ display:"flex",alignItems:"center",justifyContent:"space-between",borderBottom:"1px solid #e5e5e5",paddingBottom:"0.75rem",marginBottom:"1rem" } },
+      React.createElement("div", null,
+        React.createElement("div", { style:{ fontWeight:600,fontSize:16 } }, "Nepal e-Voting System"),
+        React.createElement("div", { style:{ fontSize:11,color:"#888" } }, "Election Commission of Nepal")
+      ),
+      React.createElement("div", { style:{ display:"flex",gap:8 } },
+        ["home","results"].map(p => React.createElement("button",{key:p,onClick:()=>setPage(p),
+          style:{fontSize:12,padding:"4px 12px",borderRadius:6,background:page===p?"#f0f0f0":"transparent",border:"1px solid #ddd",color:"#111",cursor:"pointer"}},
+          p==="home"?"Home":"Results")),
+        React.createElement("button",{onClick:()=>setPage("admin"),
+          style:{fontSize:12,padding:"4px 12px",borderRadius:6,background:page==="admin"?"#f0f0f0":"transparent",border:"1px solid #ddd",color:"#111",cursor:"pointer"}},
+          "Admin"+(adminAuth?" ✓":""))
+      )
+    ),
+    // DB indicator
+    React.createElement("div", { style:{ display:"flex",alignItems:"center",gap:6,marginBottom:8 } },
+      React.createElement("span", { style:{ width:7,height:7,borderRadius:"50%",background:"#3B6D11",display:"inline-block" } }),
+      React.createElement("span", { style:{ fontSize:10,color:"#888" } }, "IndexedDB connected — data saved permanently")
+    ),
+
+    msg && React.createElement(Alert, { message:msg.text, type:msg.type }),
+
+    page==="home"    && React.createElement(HomePage,    { setPage,voters,setCurrentVoter,showMsg }),
+    page==="vote"    && React.createElement(VotePage,    { currentVoter,voters,recordFptpVote,recordPrVote,markVoted,showMsg,setPage }),
+    page==="admin"   && React.createElement(AdminPage,   { adminAuth,setAdminAuth,voters,saveVoter,deleteVoterDB,resetVoterVote,showMsg }),
+    page==="results" && React.createElement(ResultsPage, { voters,fptpVotes,prVotes,invalidCount,totalVoters,votedCount })
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HOME PAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function HomePage({ setPage, voters, setCurrentVoter, showMsg }) {
+  const [voterId, setVoterId] = useState("");
+  const totalVoters = Object.keys(voters).length;
+  const votedCount  = Object.values(voters).filter(v => v.hasVoted).length;
+
+  const login = () => {
+    const id = voterId.trim().toUpperCase();
+    if (!id) { showMsg("Please enter your Voter ID", "error"); return; }
+    const voter = voters[id];
+    if (!voter) { showMsg("Voter ID not found. Contact your election office.", "error"); return; }
+    if (voter.hasVoted) {
+      showMsg(`Already voted on ${new Date(voter.votedAt).toLocaleString()}. Duplicate voting is NOT allowed.`, "error");
+      return;
+    }
+    setCurrentVoter({ id, ...voter });
+    setPage("vote");
+  };
+
+  return React.createElement("div", null,
+    React.createElement(Card, { style:{ marginBottom:"1rem",borderLeft:"3px solid #185FA5" } },
+      React.createElement("div",{style:{fontSize:13,fontWeight:600,color:"#0C447C",marginBottom:4}},"Federal & Provincial Election 2081 B.S."),
+      React.createElement("div",{style:{fontSize:12,color:"#666"}},"Each citizen casts TWO votes: FPTP constituency vote + Proportional Representation (Samanupatik) party vote.")
+    ),
+    React.createElement(Card, { style:{ marginBottom:"1rem" } },
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:"1rem"}},"Voter Login"),
+      React.createElement("div",{style:{fontSize:12,color:"#888",marginBottom:8}},"Enter your Voter ID Card number"),
+      React.createElement("div",{style:{display:"flex",gap:8}},
+        React.createElement("input",{value:voterId,onChange:e=>setVoterId(e.target.value),onKeyDown:e=>e.key==="Enter"&&login(),
+          placeholder:"e.g. NP-KTM-0001",style:{flex:1,padding:"8px 12px",borderRadius:8,border:"1px solid #ddd",fontSize:13}}),
+        React.createElement("button",{onClick:login,style:{padding:"8px 20px",borderRadius:8,background:"#185FA5",color:"#fff",border:"none",fontSize:13,fontWeight:500,cursor:"pointer"}},"Vote Now")
+      )
+    ),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:"1rem"}},
+      React.createElement(MetricCard,{label:"Registered Voters",value:totalVoters}),
+      React.createElement(MetricCard,{label:"Votes Cast",value:votedCount,color:"#185FA5"}),
+      React.createElement(MetricCard,{label:"Remaining",value:totalVoters-votedCount})
+    ),
+    React.createElement(Card, null,
+      React.createElement("div",{style:{fontSize:13,fontWeight:600,marginBottom:10}},"Participating Parties"),
+      React.createElement("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
+        Object.values(PARTIES).map(p=>React.createElement(Badge,{key:p.short,color:p.color,bg:p.bg,text:p.text},p.name))
+      )
+    )
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOTE PAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function VotePage({ currentVoter, voters, recordFptpVote, recordPrVote, markVoted, showMsg, setPage }) {
+  const [fptpChoice, setFptpChoice] = useState(null);
+  const [prChoice,   setPrChoice]   = useState(null);
+  const [step,       setStep]       = useState(1);
+  const [done,       setDone]       = useState(false);
+  const [saving,     setSaving]     = useState(false);
+
+  const constituency = currentVoter?.constituency;
+
+  const submitVote = async () => {
+    if (!fptpChoice || !prChoice) { showMsg("Please select both votes", "error"); return; }
+    setSaving(true);
+    try {
+      await recordFptpVote(constituency, fptpChoice);
+      await recordPrVote(prChoice);
+      await markVoted(currentVoter.id);
+      setDone(true);
+      showMsg("Vote recorded successfully!", "success");
+    } catch (e) {
+      showMsg("Database error. Please try again.", "error");
+    }
+    setSaving(false);
+  };
+
+  if (done) return React.createElement(Card, { style:{ textAlign:"center",padding:"2rem" } },
+    React.createElement("div",{style:{fontSize:48,marginBottom:12}},"✓"),
+    React.createElement("div",{style:{fontSize:16,fontWeight:600,marginBottom:6}},"Vote Recorded!"),
+    React.createElement("div",{style:{fontSize:13,color:"#888",marginBottom:16}},`Thank you, ${currentVoter.name}. Vote permanently saved.`),
+    React.createElement("div",{style:{display:"flex",gap:8,justifyContent:"center",marginBottom:16,flexWrap:"wrap"}},
+      fptpChoice && React.createElement(Badge,{color:PARTIES[fptpChoice].color,bg:PARTIES[fptpChoice].bg,text:PARTIES[fptpChoice].text},"FPTP: "+PARTIES[fptpChoice].name),
+      prChoice   && React.createElement(Badge,{color:PARTIES[prChoice].color,  bg:PARTIES[prChoice].bg,  text:PARTIES[prChoice].text},  "PR: "  +PARTIES[prChoice].name)
+    ),
+    React.createElement("button",{onClick:()=>setPage("results"),style:{padding:"9px 24px",borderRadius:8,background:"#185FA5",color:"#fff",border:"none",fontSize:13,cursor:"pointer"}},"View Live Results")
+  );
+
+  const optStyle = (sel,p) => ({ display:"flex",alignItems:"center",gap:12,padding:"12px 14px",borderRadius:8,marginBottom:8,cursor:"pointer",border:`1.5px solid ${sel?p.color:"#e5e5e5"}`,background:sel?p.bg:"#fff",transition:"all 0.15s" });
+  const radioStyle = (sel,p) => ({ width:18,height:18,borderRadius:"50%",border:`2px solid ${p.color}`,background:sel?p.color:"transparent",transition:"all 0.15s",flexShrink:0 });
+
+  return React.createElement("div", null,
+    React.createElement(Card,{style:{marginBottom:"1rem",background:"#f9f9f9"}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+        React.createElement("div",null,
+          React.createElement("div",{style:{fontSize:13,fontWeight:600}},currentVoter.name),
+          React.createElement("div",{style:{fontSize:11,color:"#888"}},`ID: ${currentVoter.id}  •  ${constituency}`)
+        ),
+        React.createElement("div",{style:{display:"flex",gap:6}},
+          React.createElement("span",{style:{padding:"3px 12px",borderRadius:20,fontSize:11,background:step===1?"#185FA5":"#EAF3DE",color:step===1?"#fff":"#27500A"}},"1. FPTP"),
+          React.createElement("span",{style:{padding:"3px 12px",borderRadius:20,fontSize:11,background:step===2?"#185FA5":"#f0f0f0",color:step===2?"#fff":"#888",border:"1px solid #ddd"}},"2. PR")
+        )
+      )
+    ),
+
+    step===1&&React.createElement(Card,{style:{marginBottom:"1rem"}},
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:4}},"Step 1: FPTP Vote"),
+      React.createElement("div",{style:{fontSize:12,color:"#888",marginBottom:14}},`Select your candidate for ${constituency} constituency`),
+      Object.entries(PARTIES).map(([k,p])=>React.createElement("div",{key:k,onClick:()=>setFptpChoice(k),style:optStyle(fptpChoice===k,p)},
+        React.createElement("div",{style:radioStyle(fptpChoice===k,p)}),
+        React.createElement("div",null,
+          React.createElement("div",{style:{fontSize:13,fontWeight:500,color:fptpChoice===k?p.text:"#111"}},p.name),
+          React.createElement("div",{style:{fontSize:11,color:"#888"}},`${p.short} — Candidate for ${constituency}`)
+        )
+      )),
+      React.createElement("button",{onClick:()=>fptpChoice?setStep(2):showMsg("Please select a party","error"),
+        style:{width:"100%",padding:"9px",borderRadius:8,background:"#185FA5",color:"#fff",border:"none",fontSize:13,fontWeight:500,marginTop:8,cursor:"pointer"}},"Next: PR Vote →")
+    ),
+
+    step===2&&React.createElement(Card,{style:{marginBottom:"1rem"}},
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:4}},"Step 2: PR / Samanupatik Vote"),
+      React.createElement("div",{style:{fontSize:12,color:"#888",marginBottom:14}},"Select the party you support at the federal level"),
+      Object.entries(PARTIES).map(([k,p])=>React.createElement("div",{key:k,onClick:()=>setPrChoice(k),style:optStyle(prChoice===k,p)},
+        React.createElement("div",{style:radioStyle(prChoice===k,p)}),
+        React.createElement("div",null,
+          React.createElement("div",{style:{fontSize:13,fontWeight:500,color:prChoice===k?p.text:"#111"}},p.name),
+          React.createElement("div",{style:{fontSize:11,color:"#888"}},p.short)
+        )
+      )),
+      React.createElement("div",{style:{display:"flex",gap:8,marginTop:8}},
+        React.createElement("button",{onClick:()=>setStep(1),style:{flex:1,padding:"9px",borderRadius:8,background:"#fff",color:"#111",border:"1px solid #ddd",fontSize:13,cursor:"pointer"}},"← Back"),
+        React.createElement("button",{onClick:()=>prChoice?submitVote():showMsg("Please select a party","error"),disabled:saving,
+          style:{flex:2,padding:"9px",borderRadius:8,background:saving?"#aaa":"#185FA5",color:"#fff",border:"none",fontSize:13,fontWeight:500,cursor:saving?"not-allowed":"pointer"}},
+          saving?"Saving...":"Submit Final Vote")
+      )
+    )
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN PAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function AdminPage({ adminAuth, setAdminAuth, voters, saveVoter, deleteVoterDB, resetVoterVote, showMsg }) {
+  const [pass,         setPass]         = useState("");
+  const [name,         setName]         = useState("");
+  const [citizenId,    setCitizenId]    = useState("");
+  const [constituency, setConstituency] = useState(CONSTITUENCIES[0]);
+  const [customId,     setCustomId]     = useState("");
+  const [tab,          setTab]          = useState("register");
+  const [search,       setSearch]       = useState("");
+  const [eyeVerified,  setEyeVerified]  = useState(false);
+  const [saving,       setSaving]       = useState(false);
+
+  const login = () => {
+    if (pass === ADMIN_PASSWORD) { setAdminAuth(true); showMsg("Admin access granted","success"); }
+    else showMsg("Incorrect password","error");
+  };
+
+  const generateId = () => {
+    const prefix = constituency.replace(/[^a-zA-Z]/g,"").substring(0,3).toUpperCase();
+    const num    = String(Object.keys(voters).length+1).padStart(4,"0");
+    return `NP-${prefix}-${num}`;
+  };
+
+  const registerVoter = async () => {
+    if (!name.trim())     { showMsg("Full name is required","error"); return; }
+    if (!citizenId.trim()){ showMsg("Citizenship ID card number is required","error"); return; }
+    if (!/^\d{9,12}$/.test(citizenId.trim())){ showMsg("Citizenship ID must be 9–12 digits","error"); return; }
+    if (!eyeVerified)     { showMsg("Eye scan verification is required","error"); return; }
+
+    const dup = Object.values(voters).find(v => v.citizenId === citizenId.trim());
+    if (dup) { showMsg("This Citizenship ID is already registered","error"); return; }
+
+    const id = customId.trim().toUpperCase() || generateId();
+    if (voters[id]) { showMsg("Voter ID already exists","error"); return; }
+
+    setSaving(true);
+    try {
+      const data = { name:name.trim(), citizenId:citizenId.trim(), constituency, hasVoted:false, registeredAt:Date.now() };
+      await saveVoter(id, data);
+      showMsg(`Voter registered! ID: ${id}  •  Iris: Verified ✓  •  Saved to database`,"success");
+      setName(""); setCitizenId(""); setCustomId(""); setEyeVerified(false);
+    } catch (e) {
+      showMsg("Database error. Could not register voter.","error");
+    }
+    setSaving(false);
+  };
+
+  const handleReset  = async (id) => { await resetVoterVote(id); showMsg(`Vote reset for ${id}`,"success"); };
+  const handleDelete = async (id) => {
+    if (!confirm(`Delete voter ${id}? This cannot be undone.`)) return;
+    await deleteVoterDB(id);
+    showMsg(`Voter ${id} deleted from database`,"info");
+  };
+
+  if (!adminAuth) return React.createElement(Card, null,
+    React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:12}},"Admin Login"),
+    React.createElement("input",{type:"password",value:pass,onChange:e=>setPass(e.target.value),onKeyDown:e=>e.key==="Enter"&&login(),
+      placeholder:"Enter admin password",style:{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid #ddd",fontSize:13,marginBottom:10}}),
+    React.createElement("button",{onClick:login,style:{width:"100%",padding:"9px",borderRadius:8,background:"#185FA5",color:"#fff",border:"none",fontSize:13,cursor:"pointer"}},"Login"),
+    React.createElement("div",{style:{fontSize:11,color:"#aaa",marginTop:8}},"Demo password: admin123")
+  );
+
+  const totalVoters = Object.keys(voters).length;
+  const votedCount  = Object.values(voters).filter(v=>v.hasVoted).length;
+  const turnout     = totalVoters>0 ? Math.round((votedCount/totalVoters)*100) : 0;
+
+  const filtered = Object.entries(voters).filter(([id,v])=>
+    id.toLowerCase().includes(search.toLowerCase()) ||
+    v.name.toLowerCase().includes(search.toLowerCase()) ||
+    (v.citizenId||"").includes(search)
+  );
+  const idValid = /^\d{9,12}$/.test(citizenId);
+
+  return React.createElement("div", null,
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:"1rem"}},
+      React.createElement(MetricCard,{label:"Registered",value:totalVoters}),
+      React.createElement(MetricCard,{label:"Voted",value:votedCount,color:"#185FA5"}),
+      React.createElement(MetricCard,{label:"Turnout",value:turnout+"%",color:"#3B6D11"}),
+      React.createElement(MetricCard,{label:"Pending",value:totalVoters-votedCount})
+    ),
+
+    React.createElement("div",{style:{display:"flex",gap:8,marginBottom:"1rem"}},
+      ["register","voters"].map(t=>React.createElement("button",{key:t,onClick:()=>setTab(t),
+        style:{padding:"6px 16px",borderRadius:8,fontSize:12,background:tab===t?"#f0f0f0":"transparent",border:"1px solid #ddd",color:"#111",cursor:"pointer"}},
+        t==="register"?"Register Voter":"Manage Voters"))
+    ),
+
+    tab==="register"&&React.createElement(Card, null,
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:"1rem"}},"Register New Voter"),
+      React.createElement("div",{style:{display:"flex",gap:24,alignItems:"flex-start"}},
+
+        // Left form
+        React.createElement("div",{style:{flex:1}},
+          React.createElement("div",{style:{marginBottom:10}},
+            React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:4}},"Full Name *"),
+            React.createElement("input",{value:name,onChange:e=>setName(e.target.value),placeholder:"Citizen's full name",
+              style:{width:"100%",padding:"7px 10px",borderRadius:8,border:"1px solid #ddd",fontSize:13,boxSizing:"border-box"}})
+          ),
+          React.createElement("div",{style:{marginBottom:10}},
+            React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:4}},"Citizenship ID Card No. *"),
+            React.createElement("input",{value:citizenId,onChange:e=>setCitizenId(e.target.value.replace(/\D/g,"")),
+              placeholder:"9–12 digit number",
+              style:{width:"100%",padding:"7px 10px",borderRadius:8,border:`1px solid ${citizenId.length>0&&!idValid?"#F7C1C1":"#ddd"}`,fontSize:13,boxSizing:"border-box"}}),
+            citizenId.length>0&&!idValid&&React.createElement("div",{style:{fontSize:10,color:"#A32D2D",marginTop:3}},"Must be 9–12 digits only")
+          ),
+          React.createElement("div",{style:{marginBottom:10}},
+            React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:4}},"Constituency"),
+            React.createElement("select",{value:constituency,onChange:e=>setConstituency(e.target.value),
+              style:{width:"100%",padding:"7px 10px",borderRadius:8,border:"1px solid #ddd",fontSize:13,background:"#fff"}},
+              CONSTITUENCIES.map(c=>React.createElement("option",{key:c,value:c},c)))
+          ),
+          React.createElement("div",{style:{marginBottom:14}},
+            React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:4}},"Custom Voter ID (optional)"),
+            React.createElement("input",{value:customId,onChange:e=>setCustomId(e.target.value),placeholder:"Auto-generated if empty",
+              style:{width:"100%",padding:"7px 10px",borderRadius:8,border:"1px solid #ddd",fontSize:13,boxSizing:"border-box"}})
+          ),
+          React.createElement("div",{style:{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}},
+            React.createElement("div",{style:{fontSize:11,padding:"4px 10px",borderRadius:20,background:(citizenId&&idValid)?"#EAF3DE":"#f0f0f0",color:(citizenId&&idValid)?"#27500A":"#aaa"}},
+              ((citizenId&&idValid)?"✓ ":"◯ ")+"Citizenship ID"),
+            React.createElement("div",{style:{fontSize:11,padding:"4px 10px",borderRadius:20,background:eyeVerified?"#EAF3DE":"#f0f0f0",color:eyeVerified?"#27500A":"#aaa"}},
+              (eyeVerified?"✓ ":"◯ ")+"Iris Verified")
+          ),
+          React.createElement("button",{onClick:registerVoter,disabled:saving,
+            style:{width:"100%",padding:"9px",borderRadius:8,background:saving?"#aaa":"#3B6D11",color:"#fff",border:"none",fontSize:13,fontWeight:500,cursor:saving?"not-allowed":"pointer"}},
+            saving?"Saving to database...":"Register Voter")
+        ),
+
+        // Right: eye scanner
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",gap:8,minWidth:200}},
+          React.createElement("div",{style:{fontSize:12,fontWeight:500,color:"#333",marginBottom:2}},"Iris / Eye Scan"),
+          React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:6,textAlign:"center"}},eyeVerified?"Biometric verified ✓":"Click scanner to begin"),
+          React.createElement(EyeScanner,{onScanComplete:ok=>{setEyeVerified(ok);if(ok)showMsg("Iris scan verified!","success");}}),
+          eyeVerified&&React.createElement("div",{style:{fontSize:11,padding:"4px 12px",borderRadius:20,background:"#EAF3DE",color:"#27500A",border:"1px solid #C0DD97"}},"✓ Iris Matched")
+        )
+      )
+    ),
+
+    tab==="voters"&&React.createElement("div", null,
+      React.createElement("input",{value:search,onChange:e=>setSearch(e.target.value),placeholder:"Search by name, voter ID, or citizenship no...",
+        style:{width:"100%",padding:"7px 12px",borderRadius:8,border:"1px solid #ddd",fontSize:13,marginBottom:10,boxSizing:"border-box"}}),
+      filtered.length===0
+        ?React.createElement("div",{style:{textAlign:"center",color:"#aaa",padding:"2rem"}},"No voters registered yet")
+        :filtered.map(([id,v])=>React.createElement(Card,{key:id,style:{marginBottom:8,padding:"10px 14px"}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+              React.createElement("div",null,
+                React.createElement("div",{style:{fontSize:13,fontWeight:500}},v.name),
+                React.createElement("div",{style:{fontSize:11,color:"#888"}},`${id}  •  ${v.constituency}`),
+                v.citizenId&&React.createElement("div",{style:{fontSize:10,color:"#aaa"}},`Citizenship: ${v.citizenId}  •  Iris: Verified ✓`)
+              ),
+              React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
+                React.createElement("span",{style:{fontSize:11,padding:"2px 8px",borderRadius:20,background:v.hasVoted?"#EAF3DE":"#FCEBEB",color:v.hasVoted?"#27500A":"#791F1F"}},v.hasVoted?"Voted":"Not voted"),
+                v.hasVoted&&React.createElement("button",{onClick:()=>handleReset(id),style:{fontSize:11,padding:"2px 8px",borderRadius:6,background:"#fff",border:"1px solid #ddd",color:"#888",cursor:"pointer"}},"Reset"),
+                React.createElement("button",{onClick:()=>handleDelete(id),style:{fontSize:11,padding:"2px 8px",borderRadius:6,background:"#FCEBEB",border:"1px solid #F7C1C1",color:"#791F1F",cursor:"pointer"}},"Delete")
+              )
+            )
+          ))
+    )
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULTS PAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function ResultsPage({ voters, fptpVotes, prVotes, invalidCount, totalVoters, votedCount }) {
+  const totalPrVotes   = Object.values(prVotes).reduce((a,b)=>a+b,0);
+  const totalFptpVotes = Object.values(fptpVotes).reduce((a,c)=>a+Object.values(c).reduce((x,y)=>x+y,0),0);
+
+  const getWinner = votes => {
+    if (!votes||Object.values(votes).every(v=>v===0)) return null;
+    return Object.entries(votes).sort((a,b)=>b[1]-a[1])[0][0];
+  };
+
+  const fptpWinners = {};
+  CONSTITUENCIES.forEach(c=>{ if(fptpVotes[c]) fptpWinners[c]=getWinner(fptpVotes[c]); });
+
+  const fptpWin = {RSP:0,NC:0,CPN:0};
+  Object.values(fptpWinners).forEach(w=>{ if(w) fptpWin[w]++; });
+
+  const PR_SEATS = 110;
+  const prSeats  = {};
+  if (totalPrVotes>0) { Object.entries(prVotes).forEach(([p,v])=>{ prSeats[p]=Math.round((v/totalPrVotes)*PR_SEATS); }); }
+  else Object.keys(PARTIES).forEach(k=>prSeats[k]=0);
+
+  const totalSeats = {};
+  Object.keys(PARTIES).forEach(k=>{ totalSeats[k]=(fptpWin[k]||0)+(prSeats[k]||0); });
+
+  const ow      = Object.entries(totalSeats).sort((a,b)=>b[1]-a[1])[0];
+  const turnout = totalVoters>0 ? Math.round((votedCount/totalVoters)*100) : 0;
+
+  return React.createElement("div", null,
+    ow&&ow[1]>0&&React.createElement(Card,{style:{marginBottom:"1rem",borderLeft:`4px solid ${PARTIES[ow[0]].color}`,background:PARTIES[ow[0]].bg}},
+      React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:4}},"Leading party — Federal Level"),
+      React.createElement("div",{style:{fontSize:18,fontWeight:600,color:PARTIES[ow[0]].text}},PARTIES[ow[0]].name),
+      React.createElement("div",{style:{fontSize:12,color:"#888"}},`${ow[1]} total seats (FPTP + PR)`)
+    ),
+
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:"1rem"}},
+      React.createElement(MetricCard,{label:"Total Voters",value:totalVoters}),
+      React.createElement(MetricCard,{label:"Votes Cast",value:votedCount,color:"#185FA5"}),
+      React.createElement(MetricCard,{label:"Voter Turnout",value:turnout+"%",color:"#3B6D11"}),
+      React.createElement(MetricCard,{label:"Invalid Votes",value:invalidCount,color:"#A32D2D"})
+    ),
+
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:"1rem"}},
+      React.createElement(Card,null,
+        React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:12}},"FPTP Results"),
+        React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:12}},"Constituency seat wins"),
+        Object.entries(PARTIES).map(([k,p])=>React.createElement("div",{key:k,style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+          React.createElement(Badge,{color:p.color,bg:p.bg,text:p.text},p.short),
+          React.createElement("div",{style:{fontSize:14,fontWeight:600}},`${fptpWin[k]||0} seats`)
+        )),
+        React.createElement("div",{style:{borderTop:"1px solid #eee",marginTop:8,paddingTop:8,fontSize:11,color:"#aaa"}},`Total FPTP votes: ${totalFptpVotes}`)
+      ),
+      React.createElement(Card,null,
+        React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:12}},"PR / Samanupatik Results"),
+        React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:12}},`${totalPrVotes} party votes`),
+        Object.entries(PARTIES).map(([k])=>React.createElement(PartyBar,{key:k,party:k,votes:prVotes[k]||0,total:totalPrVotes})),
+        React.createElement("div",{style:{borderTop:"1px solid #eee",marginTop:10,paddingTop:10}},
+          React.createElement("div",{style:{fontSize:12,fontWeight:600,marginBottom:8}},"Projected PR Seats (of 110)"),
+          React.createElement("div",{style:{display:"flex",gap:8}},
+            Object.entries(PARTIES).map(([k,p])=>React.createElement("div",{key:k,style:{flex:1,textAlign:"center",padding:"8px 4px",borderRadius:8,background:p.bg}},
+              React.createElement("div",{style:{fontSize:18,fontWeight:600,color:p.text}},prSeats[k]||0),
+              React.createElement("div",{style:{fontSize:10,color:"#888"}},p.short)
+            ))
+          )
+        )
+      )
+    ),
+
+    React.createElement(Card,{style:{marginBottom:"1rem"}},
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:12}},"Constituency-wise Winners"),
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}},
+        CONSTITUENCIES.map(c=>{
+          const w=fptpWinners[c], votes=fptpVotes[c]||{}, total=Object.values(votes).reduce((a,b)=>a+b,0);
+          return React.createElement("div",{key:c,style:{padding:"8px 10px",borderRadius:8,border:`1px solid ${w?PARTIES[w].color+"40":"#e5e5e5"}`,background:w?PARTIES[w].bg:"#f9f9f9"}},
+            React.createElement("div",{style:{fontSize:11,color:"#888",marginBottom:2}},c),
+            w?React.createElement("div",{style:{fontSize:12,fontWeight:600,color:PARTIES[w].text}},PARTIES[w].short+" wins")
+             :React.createElement("div",{style:{fontSize:11,color:"#aaa"}},"No votes yet"),
+            total>0&&React.createElement("div",{style:{fontSize:10,color:"#aaa"}},`${total} votes`)
+          );
+        })
+      )
+    ),
+
+    React.createElement(Card,null,
+      React.createElement("div",{style:{fontSize:14,fontWeight:600,marginBottom:12}},"Total Seats — Federal Level"),
+      React.createElement("div",{style:{display:"flex",gap:12}},
+        Object.entries(PARTIES).map(([k,p])=>React.createElement("div",{key:k,style:{flex:1,padding:16,borderRadius:10,textAlign:"center",border:`1px solid ${p.color}30`,background:p.bg}},
+          React.createElement("div",{style:{fontSize:28,fontWeight:700,color:p.text}},totalSeats[k]||0),
+          React.createElement("div",{style:{fontSize:11,color:"#888",marginTop:4}},p.name),
+          React.createElement("div",{style:{fontSize:10,color:"#aaa",marginTop:4}},`${fptpWin[k]||0} FPTP  +  ${prSeats[k]||0} PR`)
+        ))
+      )
+    )
+  );
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+ReactDOM.render(React.createElement(App), document.getElementById("root"));
+</script>
+</body>
+</html>
